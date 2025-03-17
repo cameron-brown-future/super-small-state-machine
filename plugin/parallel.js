@@ -1,5 +1,4 @@
 import S, { deep_merge_object, shallow_merge_object, SequenceNode, Return, Changes, Stack } from "../index.js"
-import asyncPlugin from "./async.js"
 
 export const parallelSymbol = Symbol('SSSM Parallel')
 
@@ -27,5 +26,5 @@ export class Parallel extends SequenceNode {
 	}
 }
 
-export const parallelPlugin = S.with(asyncPlugin, S.addNode(Parallel))
+export const parallelPlugin = S.addNode(Parallel)
 export default parallelPlugin

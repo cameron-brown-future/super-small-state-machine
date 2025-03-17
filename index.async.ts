@@ -152,7 +152,7 @@ export class Node {
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
-SelfType extends unknown = never,>(this: Instance<State, Output, Input, Action, Process>, node: SelfType, state: SystemState<State, Output>): Action { return node as unknown as Action }
+SelfType extends unknown = never,>(this: Instance<State, Output, Input, Action, Process>, node: SelfType, state: SystemState<State, Output>): Action | Promise<Action> { return node as unknown as Action }
 	static proceed<
 	State extends InitialState = InitialState,
 	Output extends unknown = undefined,
@@ -203,6 +203,8 @@ export type SystemState<State extends InitialState = InitialState, Output extend
 	[Trace]: Array<StackType>
 	[Changes]: Partial<State>
 	[Return]?: Output | undefined
+	[Uninterruptable]: number
+	[Interrupt]: Function
 }
 export type InputSystemState<State extends InitialState = InitialState, Output extends unknown = undefined> = State & Partial<Pick<SystemState<State, Output>, typeof Stack | typeof Return | typeof Trace | typeof Interrupts>>
 
@@ -217,7 +219,7 @@ export interface Config<
 	iterations: number,
 	until: (this: Instance<State, Output, Input, Action, Process>, state: SystemState<State, Output>, runs: number) => boolean,
 	strict: boolean | typeof StrictTypes,
-	override: null | ((...args: Input) => Output),
+	override: null | ((...args: Input) => Interruptable<Output, Process>),
 	adapt: Array<(process: Process) => Process>,
 	before: Array<(state: SystemState<State, Output>) => SystemState<State, Output>>,
 	after: Array<(state: SystemState<State, Output>) => SystemState<State, Output>>,
@@ -292,7 +294,7 @@ SelfType = SequenceType<State, Output, Action>,>(this: Instance<State, Output, I
 SelfType = SequenceType<State, Output, Action>,>(this: Instance<State, Output, Input, Action, Process>, node: SelfType, path: Path, iterate: ((path: Path) => SelfType)): SelfType { return (node as SequenceType<State, Output, Action>).map((_,i) => iterate([...path,i])) as SelfType }
 	}
 	export const FunctionN = Symbol('SSSM Function')
-	export type FunctionType<State extends InitialState = InitialState, Output extends unknown = undefined, Action extends unknown = ActionType<State, Output>> = (state: SystemState<State, Output>) => Action
+	export type FunctionType<State extends InitialState = InitialState, Output extends unknown = undefined, Action extends unknown = ActionType<State, Output>> = (state: SystemState<State, Output>) => Action | Promise<Action>
 	export class FunctionNode extends Node {
 		static type = FunctionN
 		static typeof<SelfType = FunctionType>(object: unknown, objectType: typeof object, isAction: boolean): object is SelfType { return (!isAction) && objectType === 'function' }
@@ -302,7 +304,7 @@ SelfType = SequenceType<State, Output, Action>,>(this: Instance<State, Output, I
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
-SelfType = FunctionType<State, Output, Action>,>(this: Instance<State, Output, Input, Action, Process>, node: SelfType, state: SystemState<State, Output>): Action { return (node as FunctionType<State, Output, Action>)(state) }
+SelfType = FunctionType<State, Output, Action>,>(this: Instance<State, Output, Input, Action, Process>, node: SelfType, state: SystemState<State, Output>): Action | Promise<Action> { return (node as FunctionType<State, Output, Action>)(state) }
 	}
 	export const Undefined = Symbol('SSSM Undefined')
 	export class UndefinedNode extends Node {
@@ -595,6 +597,69 @@ SelfType = BreakType,>(this: Instance<State, Output, Input, Action, Process>, no
 		}
 		static perform = Node.perform
 	}
+  export const Wait = Symbol("SSSM Wait")
+export type WaitType = typeof Wait
+export class WaitNode extends Node {
+  static type = Wait
+  static typeof<SelfType = WaitType>(object: unknown, objectType: typeof object): object is SelfType { return object === Wait }
+}
+export const uninterruptable = (...actions) => ({ [Uninterruptable]: actions.length === 1 ? actions[0] : actions })
+export const Uninterruptable = Symbol("SSSM Uninterruptable")
+export interface UninterruptableType<
+  State extends InitialState = InitialState,
+  Output extends unknown = undefined,
+  Action extends unknown = ActionType<State, Output>,
+> { [Uninterruptable]: ProcessType<State, Output, Action> }
+export class UninterruptableNode extends Node {
+    static type = Uninterruptable
+    static typeof<SelfType = UninterruptableType>(object: unknown, objectType: typeof object): object is SelfType { return Boolean(object && (objectType === 'object') && (Uninterruptable in (object as object))) }
+    static perform<
+      State extends InitialState = InitialState,
+      Output extends unknown = undefined,
+      Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
+      Action extends unknown = ActionType<State, Output>,
+      Process extends unknown = ProcessType<State, Output, Action>,
+    SelfType = UninterruptableType,>(this: Instance<State, Output, Input, Action, Process>, action: SelfType, state: SystemState<State, Output>): SystemState<State, Output> {
+        return {
+            ...state,
+            [Stack]: [  [ ...state[Stack][0], Uninterruptable ], ...state[Stack].slice(1) ],
+            [Uninterruptable]: state[Uninterruptable] + 1,
+        }
+    }
+    static proceed<
+    State extends InitialState = InitialState,
+    Output extends unknown = undefined,
+    Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
+    Action extends unknown = ActionType<State, Output>,
+    Process extends unknown = ProcessType<State, Output, Action>,
+  SelfType = UninterruptableType>(this: Instance<State, Output, Input, Action, Process>, nodeInfo: NodeInfo<SelfType>, state: SystemState<State, Output>): SystemState<State, Output> {
+        if (nodeInfo.action) return state;
+        const proceedAsNormal = Node.proceed.call(this, nodeInfo, state)
+        return { ...proceedAsNormal, [Uninterruptable]: proceedAsNormal[Uninterruptable] - 1 }
+    }
+}
+export class Interruptable<T, I = unknown, R = unknown> extends Promise<T> {
+  #interruptor: ((...interruptions: Array<I>) => Promise<R>)
+  #settled = false
+  constructor(
+    executorOrPromise: ((resolve: ((value: T) => void), reject: ((error: Error) => void)) => void) | Promise<T>,
+    interruptor: ((...interruptions: Array<I>) => Promise<R>)
+  ) {
+    const settle = <A extends Array<unknown>>(f: ((...args: A) => void)) => (...args: A) => {
+      this.#settled = true
+      f(...args)
+    }
+    if (typeof executorOrPromise === 'function') super((resolve, reject) => executorOrPromise(settle(resolve), settle(reject)))
+    else super((resolve, reject) => { Promise.resolve(executorOrPromise).then(settle(resolve)).catch(settle(reject)) })
+    this.#interruptor = interruptor
+  }
+  interrupt(...interruptions: Array<I>): Promise<R> {
+    if (this.#settled) throw new Error('A settled Interruptable cannot be interrupted.')
+    return this.#interruptor(...interruptions)
+  }
+}
+export const Interrupt = Symbol("SSSM Interrupt")
+
 export type PathUnit = SequenceGotoType | MachineGotoType | InterruptGotoType
 export type Path = Array<PathUnit>
 export type StackType = Array<Path>
@@ -610,13 +675,15 @@ export type ProcessType<
 | SwitchType<State, Output, Action>
 | WhileType<State, Output, Action>
 | FunctionType<State, Output, Action>
-| BreakType | ContinueType | InterruptGotoType | GotoType | AbsoluteGotoType | SequenceGotoType | MachineGotoType | ReturnType<Output>| ChangesType<State> | null
-// | ErrorType
+| BreakType | ContinueType | InterruptGotoType | ErrorType | GotoType | AbsoluteGotoType | SequenceGotoType | MachineGotoType | ReturnType<Output>| ChangesType<State> | null
+| UninterruptableNode
+
 export type ActionType<
 	State extends InitialState = InitialState,
 	Output extends unknown = undefined,
-> = BreakType | ContinueType | InterruptGotoType | GotoType | AbsoluteGotoType | SequenceGotoType | MachineGotoType | ReturnType<Output>| ChangesType<State> | null | undefined | void
-// | ErrorType
+> = BreakType | ContinueType | InterruptGotoType | ErrorType | GotoType | AbsoluteGotoType | SequenceGotoType | MachineGotoType | ReturnType<Output>| ChangesType<State> | null | undefined | void
+| WaitNode
+
 export class ExtensibleFunction extends Function {
 	constructor(f: Function) { super(); return Object.setPrototypeOf(f, new.target.prototype) }
 }
@@ -626,7 +693,7 @@ export interface SuperSmallStateMachineCore<
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
-> { process: Process; (...args: Input): Output; }
+> { process: Process; (...args: Input): Interruptable<Output, Process>; }
 export abstract class SuperSmallStateMachineCore<
 	State extends InitialState = InitialState,
 	Output extends unknown = undefined,
@@ -644,7 +711,7 @@ export abstract class SuperSmallStateMachineCore<
 		trace: false,
 		deep: false,
 		override: null,
-		nodes: new Nodes(ChangesNode, SequenceNode, FunctionNode, ConditionNode, SwitchNode, WhileNode, MachineNode, GotoNode, InterruptGotoNode, AbsoluteGotoNode, MachineGotoNode, SequenceGotoNode, ErrorNode, UndefinedNode, EmptyNode, ContinueNode, BreakNode, ReturnNode),
+		nodes: new Nodes(ChangesNode, SequenceNode, FunctionNode, ConditionNode, SwitchNode, WhileNode, MachineNode, GotoNode, InterruptGotoNode, AbsoluteGotoNode, MachineGotoNode, SequenceGotoNode, ErrorNode, UndefinedNode, EmptyNode, ContinueNode, BreakNode, ReturnNode, WaitNode, UninterruptableNode),
 		adapt: [],
 		before: [],
 		after: [],
@@ -735,24 +802,56 @@ export abstract class SuperSmallStateMachineCore<
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
->(instance: Instance<State, Output, Input, Action, Process>, ...input: Input): Output {
-		const { until, iterations, input: adaptInput, output: adaptOutput, before, after, defaults, trace } = { ...this.config, ...instance.config }
-		const modifiedInput = adaptInput.apply(instance, input) || {}
-		let r = 0, currentState = { ...before.reduce((prev, modifier) => modifier.call(instance, prev), this._changes(instance, {
-			[Changes]: {},
-			...defaults,
-			[Stack]: modifiedInput[Stack] || [[]], [Interrupts]: modifiedInput[Interrupts] || [], [Trace]: modifiedInput[Trace] || [],
-			...(Return in modifiedInput ? {[Return]: modifiedInput[Return]} : {})
-		} as SystemState<State, Output>, modifiedInput)), [Changes]: {} }
-		while (r < iterations) {
-			if (until.call(instance, currentState, r)) break;
-			if (++r >= iterations) throw new MaxIterationsError(`Maximum iterations of ${iterations} reached at path [ ${currentState[Stack][0].map(key => key.toString()).join(', ')} ]`, { instance, state: currentState, data: { iterations } })
-			if (trace) currentState = { ...currentState, [Trace]: [ ...currentState[Trace], currentState[Stack] ] }
-			const action = this._execute(instance, currentState)
-			currentState = this._perform(instance, currentState, action)
-			currentState = this._proceed(instance, currentState, { node: action, action: true })
+>(instance: Instance<State, Output, Input, Action, Process>, ...input: Input): Interruptable<Output, Process> {
+  
+		if (typeof instance.process !== 'object')
+			throw new Error(`The top-level of an asynchronous state machine must be an object so that system interrupts may be performed.`)
+		let interruptionStack: Array<symbol> = []
+		let interruptionResolve = noop
+		const waitForInterruption = resolve => {interruptionResolve = () => {resolve();interruptionResolve = noop}}
+
+		const executor = async () => {
+			const { until, iterations, input: adaptInput, output: adaptOutput, before, after, defaults, trace } = { ...S.config, ...instance.config }
+			const modifiedInput = (await adaptInput.apply(instance, input)) || {}
+			let r = 0, currentState = { ...before.reduce((prev, modifier) => modifier.call(instance, prev), S._changes(instance, {
+				[Changes]: {},
+				...defaults,
+		[Stack]: modifiedInput[Stack] || [[]],
+		[Interrupts]: modifiedInput[Interrupts] || [],
+		[Trace]: modifiedInput[Trace] || [],
+				[Uninterruptable]: 0,
+				[Interrupt]: (...args) => interruptable.interrupt(...args),
+				...(Return in modifiedInput ? {[Return]: modifiedInput[Return]} : {})
+			}, modifiedInput)), [Changes]: {} }
+			while (r < iterations) {
+				if (await until.call(instance, currentState, r)) break;
+				if (++r >= iterations) throw new MaxIterationsError(`Maximum iterations of ${iterations} reached at path [ ${currentState[Stack][0].map(key => key.toString()).join(', ')} ]`, { instance: instance, state: currentState, data: { iterations } })
+				if (trace) currentState = { ...currentState, [Trace]: [ ...currentState[Trace], currentState[Stack] ] }
+				if (interruptionStack.length && currentState[Uninterruptable] <= 0) {
+					while (interruptionStack.length)
+						currentState = await S._perform(instance, currentState, interruptionStack.shift() as Action)
+				} else {
+					const action = await S._execute(instance, currentState)
+					if (action === Wait && !interruptionStack.length) await new Promise(waitForInterruption)
+					currentState = await S._perform(instance, currentState, action)
+					currentState = await S._proceed(instance, currentState, { node: action, action: true })
+				}
+			}
+			return adaptOutput.call(instance, after.reduce((prev, modifier) => modifier.call(instance, prev), currentState))
 		}
-		return adaptOutput.call(instance, after.reduce((prev, modifier) => modifier.call(instance, prev), currentState))
+		const interrupter = (...interruptions) => new Promise(resolve => {
+			const systemInterruption = Symbol("System Interruption")
+			const interruption = Symbol("User Interruption")
+			const lastInterruption = (interruptions.length && instance.config.nodes.typeof(interruptions[interruptions.length - 1]) === InterruptGotoNode.type)
+				? interruptions[interruptions.length - 1] : interruption
+			const resolveInterruption = state => resolve(state[lastInterruption])
+			instance.process[systemInterruption] = [interruption, resolveInterruption]
+			instance.process[interruption] = instance.config.adapt.reduce((prev, adapter) => adapter.call(instance, prev), interruptions)
+			interruptionStack.push(systemInterruption)
+			interruptionResolve()
+		})
+		const interruptable = new Interruptable<Output, Process>(executor(), interrupter)
+		return interruptable
 	}
 }
 export abstract class SuperSmallStateMachineChain<
@@ -810,7 +909,7 @@ export abstract class SuperSmallStateMachineChain<
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
->(...input: Input) { return (instance: Instance<State, Output, Input, Action, Process>): Output => this._run(instance, ...input) }
+>(...input: Input) { return (instance: Instance<State, Output, Input, Action, Process>): Interruptable<Output, Process> => this._run(instance, ...input) }
 	static do<
 	State extends InitialState = InitialState,
 	Output extends unknown = undefined,
@@ -918,7 +1017,7 @@ export abstract class SuperSmallStateMachineChain<
 	Input extends Array<unknown> = [Partial<InputSystemState<State, Output>>] | [],
 	Action extends unknown = ActionType<State, Output>,
 	Process extends unknown = ProcessType<State, Output, Action>,
->(override: ((...args: Input) => Output) | null) { return (instance: Instance<State, Output, Input, Action, Process>): Instance<State, Output, Input, Action, Process> => ({ process: instance.process, config: { ...instance.config, override } }) }
+>(override: ((...args: Input) => Interruptable<Output, Process>) | null) { return (instance: Instance<State, Output, Input, Action, Process>): Instance<State, Output, Input, Action, Process> => ({ process: instance.process, config: { ...instance.config, override } }) }
 	static addNode<
 	State extends InitialState = InitialState,
 	Output extends unknown = undefined,
@@ -978,7 +1077,7 @@ export default class S<
 	#config: Config<State, Output, Input, Action, Process> = S.config as unknown as Config<State, Output, Input, Action, Process>
 	get config(): Config<State, Output, Input, Action, Process> { return { ...this.#config } }
 	constructor(process: Process = (null as Process), config: Config<State, Output, Input, Action, Process> = (S.config as unknown as Config<State, Output, Input, Action, Process>)) {
-		super((...input: Input): Output => (config.override || this.run).apply(this, input))
+		super((...input: Input): Interruptable<Output, Process> => (config.override || this.run).apply(this, input))
 		this.#config = { ...this.#config, ...config } as unknown as Config<State, Output, Input, Action, Process>
 		this.process = process
 	}
@@ -988,7 +1087,7 @@ export default class S<
 	perform(state: SystemState<State, Output>, action: Action) { return S._perform(this, state, action) }
 	execute(state: SystemState<State, Output>, node: Process) { return S._execute(this, state, node) }
 	traverse(iterator: ((node: Process, path: Path, process: Process, nodeType: string | symbol) => Process)){ return S._traverse(this, iterator) }
-	run (...input: Input): Output { return S._run(this, ...input) }
+	run (...input: Input): Interruptable<Output, Process> { return S._run(this, ...input) }
 	do(process: Process): S<State, Output, Input, Action, Process> { return this.with(S.do(process)) }
 	defaults<NewState extends InitialState = State>(defaults: NewState): S<NewState, Output, [Partial<InputSystemState<NewState>>] | [], ActionType<NewState, Output>, ProcessType<NewState, Output, ActionType<NewState, Output>>> { return this.with(S.defaults(defaults)) }
 	input<NewInput extends Array<unknown> = Array<unknown>>(input: (...input: NewInput) => Partial<InputSystemState<State, Output>>): S<State, Output, NewInput, Action, Process> { return this.with(S.input(input)) }
@@ -1003,7 +1102,7 @@ export default class S<
 	for(iterations: number): S<State, Output, Input, Action, Process> { return this.with(S.for(iterations)) }
 	until(until: Config<State, Output, Input, Action, Process>['until']): S<State, Output, Input, Action, Process> { return this.with(S.until(until)) }
 	get forever(): S<State, Output, Input, Action, Process> { return this.with(S.forever) }
-	override(override: ((...args: Input) => Output) | null): S<State, Output, Input, Action, Process> { return this.with(S.override(override)) }
+	override(override: ((...args: Input) => Interruptable<Output, Process>) | null): S<State, Output, Input, Action, Process> { return this.with(S.override(override)) }
 	addNode(...nodes: any[]) { return this.with(S.addNode(...nodes)) }
 	adapt(...adapters: Array<(process: Process) => Process>): S<State, Output, Input, Action, Process> { return this.with(S.adapt(...adapters)) }
 	before(...adapters: Array<(state: SystemState<State, Output>) => SystemState<State, Output>>): S<State, Output, Input, Action, Process> { return this.with(S.before(...adapters)) }
